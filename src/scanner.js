@@ -3,10 +3,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { RULES, severityRank } from './rules.js';
 
-const TEXT_EXTENSIONS = new Set([
-  '.js','.jsx','.ts','.tsx','.mjs','.cjs','.json','.md','.txt','.env','.sql','.yml','.yaml','.toml','.ini','.conf','.properties'
-]);
-const SKIP_DIRS = new Set(['node_modules','.git','.next','dist','build','coverage','.turbo']);
+const TEXT_EXTENSIONS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs','.json','.md','.txt','.env','.sql','.yml','.yaml','.toml','.ini','.conf','.properties','.html']);
+const SKIP_DIRS = new Set(['node_modules','.git','.next','dist','build','coverage','.turbo','.cache']);
 
 function walk(dir, root = dir, files = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -24,20 +22,19 @@ function walk(dir, root = dir, files = []) {
   return files;
 }
 
-function readSafe(file) {
-  try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
-}
-
-function finding(ruleId, file, evidence, recommendation, confidence = 'high') {
-  const rule = RULES.find(r => r.id === ruleId);
-  return { ...rule, file, evidence, recommendation, confidence };
-}
-
+function readSafe(file) { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } }
+function ruleById(id) { return RULES.find(r => r.id === id); }
+function finding(ruleId, file, evidence, recommendation, confidence = 'high') { return { ...ruleById(ruleId), file, evidence, recommendation, confidence }; }
 function lineEvidence(content, needle) {
   const lines = content.split(/\r?\n/);
-  const idx = lines.findIndex(l => typeof needle === 'string' ? l.includes(needle) : needle.test(l));
+  const idx = lines.findIndex(l => typeof needle === 'string' ? l.includes(needle) : new RegExp(needle.source, needle.flags.replace('g','')).test(l));
   if (idx < 0) return '';
   return `line ${idx + 1}: ${lines[idx].trim().slice(0, 180)}`;
+}
+function hasAny(files, regex) { return files.some(f => regex.test(f.content) || regex.test(f.rel)); }
+
+export function buildFixPrompt(f) {
+  return `You are fixing a production-readiness issue in an existing application.\n\nIssue: ${f.title} (${f.id})\nSeverity: ${f.severity}\nFile: ${f.file}\nEvidence: ${f.evidence || 'See the referenced file.'}\nWhy it matters: ${f.why}\nRequired remediation: ${f.recommendation}\n\nMake the smallest safe change that fixes this issue without changing unrelated behavior. Preserve existing interfaces unless the security fix requires otherwise. Add or update a focused automated test that proves the vulnerable behavior is blocked and the intended behavior still works. Explain any credential rotation, database policy, deployment-secret, or infrastructure step that cannot be completed only in source code.`;
 }
 
 export function scanDirectory(rootDir) {
@@ -56,12 +53,14 @@ export function scanDirectory(rootDir) {
 
   for (const f of all) {
     for (const [pattern, label] of secretPatterns) {
-      if (pattern.test(f.content)) {
-        findings.push(finding('SR-001', f.rel, lineEvidence(f.content, pattern), `Rotate the ${label} immediately, remove it from Git history, and load it from a deployment secret store.`));
-      }
+      if (pattern.test(f.content)) findings.push(finding('SR-001', f.rel, lineEvidence(f.content, pattern), `Rotate the ${label} immediately, remove it from Git history, and load it from a deployment secret store.`));
     }
     if (/^\.env(?:\.|$)/.test(path.basename(f.rel)) && /(?:KEY|SECRET|TOKEN|PASSWORD)\s*=/.test(f.content)) {
       findings.push(finding('SR-002', f.rel, 'Environment file contains credential-like variables.', 'Remove the file from version control, rotate exposed credentials, add it to .gitignore, and provide a redacted .env.example instead.'));
+    }
+    const publicPrivileged = /\b(?:NEXT_PUBLIC_|VITE_|PUBLIC_)[A-Z0-9_]*(?:SERVICE_ROLE|SECRET|PRIVATE|PASSWORD|TOKEN)[A-Z0-9_]*\s*=\s*[^\s"']{6,}/i;
+    if (publicPrivileged.test(f.content)) {
+      findings.push(finding('SR-009', f.rel, lineEvidence(f.content, publicPrivileged), 'Remove the public/client prefix, rotate the exposed credential, and access the secret only from trusted server-side code. Never ship service-role or private tokens to the browser.'));
     }
     if (/Access-Control-Allow-Origin["'\s,:=*]+\*/i.test(f.content) || /origin\s*:\s*["']\*["']/i.test(f.content)) {
       findings.push(finding('SR-005', f.rel, lineEvidence(f.content, /(?:Access-Control-Allow-Origin|origin\s*:)/i), 'Restrict allowed origins to your production domains and separate development CORS configuration.'));
@@ -69,13 +68,15 @@ export function scanDirectory(rootDir) {
     if (/console\.(log|debug)\(/.test(f.content) && /(token|secret|password|authorization|payload|user|email)/i.test(f.content)) {
       findings.push(finding('SR-008', f.rel, lineEvidence(f.content, /console\.(log|debug)\(/), 'Use structured logs, redact sensitive fields, and disable verbose payload logging in production.', 'medium'));
     }
+    if (/dangerouslySetInnerHTML\s*=/.test(f.content) && !/(DOMPurify|sanitizeHtml|sanitize\()/i.test(f.content)) {
+      findings.push(finding('SR-010', f.rel, lineEvidence(f.content, /dangerouslySetInnerHTML\s*=/), 'Avoid dangerouslySetInnerHTML for untrusted values. If HTML is required, sanitize with a well-maintained allowlist sanitizer before rendering and add an XSS regression test.', 'low'));
+    }
   }
 
   const stripeFiles = all.filter(f => /stripe/i.test(f.content) && /(webhook|checkout\.session|payment_intent)/i.test(f.content));
   for (const f of stripeFiles) {
-    const isWebhook = /webhook|checkout\.session|payment_intent/i.test(f.content);
     const verifies = /(constructEvent|webhooks\.constructEvent|verify.*signature|stripe-signature)/i.test(f.content);
-    if (isWebhook && !verifies) findings.push(finding('SR-003', f.rel, 'Stripe event handling found but no obvious webhook signature verification was detected.', 'Verify the raw request body using Stripe\'s webhook signing secret before trusting event type, customer, amount, or subscription state.', 'medium'));
+    if (!verifies) findings.push(finding('SR-003', f.rel, 'Stripe event handling found but no obvious webhook signature verification was detected.', 'Verify the raw request body using Stripe\'s webhook signing secret before trusting event type, customer, amount, or subscription state.', 'medium'));
   }
 
   const sqlFiles = all.filter(f => f.rel.endsWith('.sql'));
@@ -83,7 +84,7 @@ export function scanDirectory(rootDir) {
     const tables = [...f.content.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?(?:public\.)?(["\w]+)/ig)].map(m => m[1].replaceAll('"',''));
     for (const table of tables) {
       const rls = new RegExp(`alter\\s+table\\s+(?:public\\.)?["']?${table}["']?\\s+enable\\s+row\\s+level\\s+security`, 'i');
-      if (!rls.test(f.content)) findings.push(finding('SR-004', f.rel, `Table '${table}' is created in this migration but RLS enablement was not found in the same migration.`, `Enable Row Level Security for ${table}, then add explicit SELECT/INSERT/UPDATE/DELETE policies and test with multiple users.`, 'medium'));
+      if (!rls.test(f.content)) findings.push(finding('SR-004', f.rel, `Table '${table}' is created in this migration but RLS enablement was not found in the same migration.`, `Enable Row Level Security for ${table}, then add explicit SELECT/INSERT/UPDATE/DELETE policies and test with at least two distinct users.`, 'medium'));
     }
   }
 
@@ -100,26 +101,42 @@ export function scanDirectory(rootDir) {
     if (!/(rateLimit|ratelimit|upstash|limiter|429)/i.test(f.content)) findings.push(finding('SR-007', f.rel, 'Potential public/AI endpoint with no obvious rate limiting signal.', 'Add IP/user-based rate limiting, sensible quotas, and 429 responses. For AI endpoints, enforce per-user spend limits.', 'low'));
   }
 
+  const stack = detectStack(all);
+  if (stack.nextjs) {
+    const hasHeaders = hasAny(all, /(Content-Security-Policy|X-Frame-Options|frame-ancestors|Referrer-Policy|headers\s*\(\)|async\s+headers)/i);
+    if (!hasHeaders) findings.push(finding('SR-011', 'next.config / middleware', 'Next.js detected but no obvious baseline security-header configuration was found.', 'Add baseline response headers, especially a Content-Security-Policy tailored to the app, frame-ancestors protection, Referrer-Policy, and X-Content-Type-Options.', 'low'));
+  }
+
+  const names = new Set(all.map(f => f.rel.toLowerCase()));
+  const hasTests = all.some(f => /(^|\/)(__tests__|test|tests|spec)(\/|\.|$)/i.test(f.rel)) || hasAny(all, /["']test["']\s*:/i);
+  if ((stack.nextjs || stack.supabase || stack.stripe) && !hasTests) findings.push(finding('SR-012', 'repository', 'No test/spec files or package test script were detected.', 'Add a small automated regression suite covering authentication/authorization boundaries, billing webhooks, and the highest-risk data access paths.', 'medium'));
+  if (names.has('package.json') && !['package-lock.json','pnpm-lock.yaml','yarn.lock','bun.lockb','bun.lock'].some(n => names.has(n))) {
+    findings.push(finding('SR-013', 'repository', 'package.json exists but no supported dependency lockfile was detected.', 'Commit the lockfile produced by your package manager and use frozen/locked installs in CI and production.', 'high'));
+  }
+
   const unique = [];
   const seen = new Set();
   for (const x of findings) {
     const key = `${x.id}|${x.file}|${x.evidence}`;
-    if (!seen.has(key)) { seen.add(key); unique.push(x); }
+    if (!seen.has(key)) { seen.add(key); unique.push({ ...x, fixPrompt: buildFixPrompt(x) }); }
   }
   unique.sort((a,b) => severityRank[b.severity] - severityRank[a.severity]);
   const scorePenalty = unique.reduce((n, f) => n + f.weight * (f.confidence === 'low' ? 0.45 : f.confidence === 'medium' ? 0.7 : 1), 0);
   const score = Math.max(0, Math.round(100 - scorePenalty));
   const blockers = unique.filter(f => f.severity === 'blocker').length;
-  const verdict = blockers > 0 || score < 70 ? 'DO NOT SHIP YET' : score < 85 ? 'SHIP WITH CAUTION' : 'READY FOR HUMAN REVIEW';
-  const stack = detectStack(all);
+  const targetSignals = [stack.nextjs, stack.supabase, stack.stripe].filter(Boolean).length;
+  const coverage = targetSignals >= 2 ? 'strong' : targetSignals === 1 ? 'partial' : 'limited';
+  const verdict = coverage === 'limited' ? 'LIMITED COVERAGE' : blockers > 0 || score < 70 ? 'DO NOT SHIP YET' : score < 85 ? 'SHIP WITH CAUTION' : 'READY FOR HUMAN REVIEW';
+
   return {
     product: 'ShipReady AI',
-    version: '0.1.0',
+    version: '0.3.0',
     scannedAt: new Date().toISOString(),
     scanId: crypto.createHash('sha256').update(root + Date.now()).digest('hex').slice(0,12),
     root: path.basename(root),
     filesScanned: all.length,
     stack,
+    coverage,
     score,
     verdict,
     summary: {
@@ -136,7 +153,7 @@ function detectStack(files) {
   const names = new Set(files.map(f => f.rel));
   const joined = files.map(f => f.content).join('\n');
   return {
-    nextjs: names.has('next.config.js') || names.has('next.config.mjs') || /["']next["']\s*:/.test(joined),
+    nextjs: names.has('next.config.js') || names.has('next.config.mjs') || names.has('next.config.ts') || /["']next["']\s*:/.test(joined),
     supabase: /@supabase\/|SUPABASE_URL|supabase/i.test(joined),
     stripe: /["']stripe["']\s*:|from\s+["']stripe["']|stripe\.webhooks/i.test(joined),
     vercel: names.has('vercel.json') || /VERCEL_URL/.test(joined)
