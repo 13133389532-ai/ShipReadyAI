@@ -25,11 +25,19 @@ function walk(dir, root = dir, files = []) {
 function readSafe(file) { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } }
 function ruleById(id) { return RULES.find(r => r.id === id); }
 function finding(ruleId, file, evidence, recommendation, confidence = 'high') { return { ...ruleById(ruleId), file, evidence, recommendation, confidence }; }
+function redactEvidenceLine(line) {
+  return String(line)
+    .replace(/\bsk_live_[A-Za-z0-9]{8,}\b/g, 'sk_live_[REDACTED]')
+    .replace(/\bsk-proj-[A-Za-z0-9_-]{8,}\b/g, 'sk-proj-[REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9]{16,}\b/g, 'sk-[REDACTED]')
+    .replace(/((?:SERVICE_ROLE|SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY)[A-Z0-9_]*\s*[=:]\s*)[^\s,;\"']+/ig, '$1[REDACTED]')
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9._~-]+/ig, '$1[REDACTED]');
+}
 function lineEvidence(content, needle) {
   const lines = content.split(/\r?\n/);
   const idx = lines.findIndex(l => typeof needle === 'string' ? l.includes(needle) : new RegExp(needle.source, needle.flags.replace('g','')).test(l));
   if (idx < 0) return '';
-  return `line ${idx + 1}: ${lines[idx].trim().slice(0, 180)}`;
+  return `line ${idx + 1}: ${redactEvidenceLine(lines[idx].trim()).slice(0, 180)}`;
 }
 function hasAny(files, regex) { return files.some(f => regex.test(f.content) || regex.test(f.rel)); }
 
