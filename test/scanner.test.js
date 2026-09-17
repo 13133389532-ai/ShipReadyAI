@@ -27,3 +27,14 @@ test('uses LIMITED COVERAGE for unrelated stacks instead of claiming readiness',
   const fx = fixture({'Main.java':'class Main {}'});
   try { assert.equal(scanDirectory(fx.root).verdict,'LIMITED COVERAGE'); } finally { fx.cleanup(); }
 });
+
+test('redacts detected secret values from report evidence', () => {
+  const fx = fixture({ 'package.json':'{"dependencies":{"next":"15.0.0"}}', '.env.local':'OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456' });
+  try {
+    const report = scanDirectory(fx.root);
+    const secret = report.findings.find(f=>f.id==='SR-001');
+    assert.ok(secret);
+    assert.doesNotMatch(secret.evidence, /abcdefghijklmnopqrstuvwxyz123456/);
+    assert.match(secret.evidence, /REDACTED/);
+  } finally { fx.cleanup(); }
+});
