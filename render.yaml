@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: shipready-ai
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: FREE_SCAN_LIMIT
+        value: "3"
+      - key: LEMONSQUEEZY_STARTER_CHECKOUT_URL
+        sync: false
+      - key: LEMONSQUEEZY_PRO_CHECKOUT_URL
+        sync: false
+      - key: LEMONSQUEEZY_WEBHOOK_SECRET
+        sync: false
+      - key: FIX_PACK_CONTACT_URL
+        sync: false
